@@ -1,11 +1,17 @@
+from pathlib import Path
+
+import joblib
+import numpy as np
 import requests
 import streamlit as st
 
-# API URL comes from Streamlit Secrets on the cloud, localhost when running locally
+# API URL comes from Streamlit Secrets; if it is not set, only the direct model is used
 try:
     API_URL = st.secrets["API_URL"]
 except Exception:
-    API_URL = "http://127.0.0.1:8000"
+    API_URL = None
+
+MODEL_PATH = Path(__file__).parent / "model.pkl"
 
 st.set_page_config(
     page_title="Student Predictor",
@@ -13,12 +19,20 @@ st.set_page_config(
     layout="centered",
 )
 
+
+# ---------- Model (used only as a fallback, cached) ----------
+@st.cache_resource
+def load_model():
+    return joblib.load(MODEL_PATH)
+
+
 # ---------- State (decides which theme we show) ----------
 if "state" not in st.session_state:
     st.session_state.state = "idle"  # idle | pass | fail
     st.session_state.result = None
     st.session_state.error = None
     st.session_state.celebrate = False
+    st.session_state.source = None
 
 
 def reset_theme():
@@ -28,32 +42,55 @@ def reset_theme():
     st.session_state.error = None
 
 
+def predict_via_api(hours, score):
+    response = requests.post(
+        f"{API_URL}/predict",
+        json={"study_hours": hours, "prev_score": score},
+        headers={"ngrok-skip-browser-warning": "true"},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def predict_direct(hours, score):
+    model = load_model()
+    features = np.array([[hours, score]])
+    prediction = int(model.predict(features)[0])
+    probabilities = model.predict_proba(features)[0]
+    return {
+        "prediction": prediction,
+        "result_label": "Pass" if prediction == 1 else "Fail",
+        "confidence": round(float(probabilities[prediction]), 3),
+    }
+
+
 def run_prediction():
     """Called when the button is clicked (runs before the page reruns)."""
-    try:
-        response = requests.post(
-            f"{API_URL}/predict",
-            json={
-                "study_hours": st.session_state.study_hours,
-                "prev_score": st.session_state.prev_score,
-            },
-            headers={"ngrok-skip-browser-warning": "true"},
-            timeout=30,
-        )
-    except requests.exceptions.RequestException:
-        reset_theme()
-        st.session_state.error = (
-            "Could not reach the prediction API. Is FastAPI and ngrok running?"
-        )
-        return
+    hours = st.session_state.study_hours
+    score = st.session_state.prev_score
+    result, source = None, None
 
-    if response.status_code != 200:
-        reset_theme()
-        st.session_state.error = f"API returned an error (status {response.status_code})."
-        return
+    # 1) Try the FastAPI backend first (client-server)
+    if API_URL:
+        try:
+            result = predict_via_api(hours, score)
+            source = "FastAPI backend (via ngrok)"
+        except requests.exceptions.RequestException:
+            pass
 
-    result = response.json()
+    # 2) If the API is not reachable, use the model directly
+    if result is None:
+        try:
+            result = predict_direct(hours, score)
+            source = "Direct model (API not reachable)"
+        except Exception as e:
+            reset_theme()
+            st.session_state.error = f"Prediction failed: {e}"
+            return
+
     st.session_state.result = result
+    st.session_state.source = source
     st.session_state.error = None
 
     if result["prediction"] == 1:
@@ -263,6 +300,7 @@ div.stButton > button:active { transform: scale(0.98); color: #07040f; }
 .bar-bg { height: 12px; background: rgba(255, 255, 255, 0.12); border-radius: 99px; overflow: hidden; }
 .bar-fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--accent), var(--accent2)); animation: grow 1.2s ease both; }
 .result .conf { color: #efeaff; margin-top: 0.6rem; font-size: 0.95rem; }
+.source { text-align: center; color: #cfcbe8; font-size: 0.85rem; margin-top: 0.8rem; }
 
 /* ----- Summary chips ----- */
 .chips { display: flex; gap: 1rem; margin-top: 1.6rem; animation: fadeUp 1.1s ease both; }
@@ -337,6 +375,7 @@ if st.session_state.error:
 result = st.session_state.result
 if result:
     pct = result["confidence"] * 100
+    source = st.session_state.source or "unknown"
     st.markdown(
         f"""
 <div class="result">
@@ -344,6 +383,7 @@ if result:
     <div class="verdict">{t['emoji']} {result['result_label']}</div>
     <div class="bar-bg"><div class="bar-fill" style="width: {pct:.1f}%;"></div></div>
     <div class="conf">Model confidence: <b>{pct:.1f}%</b></div>
+    <div class="source">⚙️ Served by: {source}</div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -353,7 +393,7 @@ if result:
         st.balloons()
         st.session_state.celebrate = False
 
-    with st.expander("🔍 See what was sent to the API"):
+    with st.expander("🔍 See the model input and output"):
         st.json({"study_hours": study_hours, "prev_score": prev_score})
         st.json(result)
 
