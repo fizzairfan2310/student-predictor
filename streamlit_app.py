@@ -1,23 +1,17 @@
-from pathlib import Path
-
-import joblib
-import numpy as np
+import requests
 import streamlit as st
 
-MODEL_PATH = Path(__file__).parent / "model.pkl"
+# API URL comes from Streamlit Secrets on the cloud, localhost when running locally
+try:
+    API_URL = st.secrets["API_URL"]
+except Exception:
+    API_URL = "http://127.0.0.1:8000"
 
 st.set_page_config(
     page_title="Student Predictor",
     page_icon="🌌",
     layout="centered",
 )
-
-
-# ---------- Model (loaded once, then cached) ----------
-@st.cache_resource
-def load_model():
-    return joblib.load(MODEL_PATH)
-
 
 # ---------- State (decides which theme we show) ----------
 if "state" not in st.session_state:
@@ -37,29 +31,32 @@ def reset_theme():
 def run_prediction():
     """Called when the button is clicked (runs before the page reruns)."""
     try:
-        model = load_model()
-        features = np.array(
-            [[st.session_state.study_hours, st.session_state.prev_score]]
+        response = requests.post(
+            f"{API_URL}/predict",
+            json={
+                "study_hours": st.session_state.study_hours,
+                "prev_score": st.session_state.prev_score,
+            },
+            headers={"ngrok-skip-browser-warning": "true"},
+            timeout=30,
         )
-        prediction = int(model.predict(features)[0])
-        probabilities = model.predict_proba(features)[0]
-    except FileNotFoundError:
+    except requests.exceptions.RequestException:
         reset_theme()
-        st.session_state.error = "model.pkl not found. Make sure it is in the same folder as this file."
-        return
-    except Exception as e:
-        reset_theme()
-        st.session_state.error = f"Prediction failed: {e}"
+        st.session_state.error = (
+            "Could not reach the prediction API. Is FastAPI and ngrok running?"
+        )
         return
 
-    st.session_state.result = {
-        "prediction": prediction,
-        "result_label": "Pass" if prediction == 1 else "Fail",
-        "confidence": round(float(probabilities[prediction]), 3),
-    }
+    if response.status_code != 200:
+        reset_theme()
+        st.session_state.error = f"API returned an error (status {response.status_code})."
+        return
+
+    result = response.json()
+    st.session_state.result = result
     st.session_state.error = None
 
-    if prediction == 1:
+    if result["prediction"] == 1:
         st.session_state.state = "pass"
         st.session_state.celebrate = True
     else:
@@ -356,7 +353,7 @@ if result:
         st.balloons()
         st.session_state.celebrate = False
 
-    with st.expander("🔍 See the model input and output"):
+    with st.expander("🔍 See what was sent to the API"):
         st.json({"study_hours": study_hours, "prev_score": prev_score})
         st.json(result)
 
